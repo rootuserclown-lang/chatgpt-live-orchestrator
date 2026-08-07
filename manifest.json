@@ -1,1 +1,38 @@
-{"manifest_version":3,"name":"ChatGPT Local Orchestrator","version":"3.2.0","description":"Chrome side-panel orchestrator with workflow routing, voice input, visible ChatGPT interaction, and explicit local-action handoff.","permissions":["activeTab","tabs","sidePanel","storage"],"host_permissions":["https://chatgpt.com/*","https://chat.openai.com/*"],"action":{"default_title":"ChatGPT Local Orchestrator"},"side_panel":{"default_path":"sidepanel.html"},"background":{"service_worker":"background.js"},"content_scripts":[{"matches":["https://chatgpt.com/*","https://chat.openai.com/*"],"js":["content.js"],"run_at":"document_idle"}]}
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Local Orchestrator",
+  "version": "3.3.0",
+  "description": "Chrome side-panel orchestrator with resilient ChatGPT routing, visible interaction, response observation, and voice input.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "sidePanel",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "action": {
+    "default_title": "ChatGPT Local Orchestrator"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
