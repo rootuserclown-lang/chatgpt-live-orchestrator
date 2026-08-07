@@ -14,11 +14,59 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Upgrade background router
+      - name: Write manifest
+        shell: bash
+        run: |
+          cat > manifest.json <<'EOF'
+          {
+            "manifest_version": 3,
+            "name": "ChatGPT Local Orchestrator",
+            "version": "3.3.0",
+            "description": "Chrome side-panel orchestrator with resilient ChatGPT routing, visible interaction, response observation, and voice input.",
+            "permissions": [
+              "activeTab",
+              "tabs",
+              "sidePanel",
+              "storage",
+              "scripting"
+            ],
+            "host_permissions": [
+              "https://chatgpt.com/*",
+              "https://chat.openai.com/*"
+            ],
+            "action": {
+              "default_title": "ChatGPT Local Orchestrator"
+            },
+            "side_panel": {
+              "default_path": "sidepanel.html"
+            },
+            "background": {
+              "service_worker": "background.js"
+            },
+            "content_scripts": [
+              {
+                "matches": [
+                  "https://chatgpt.com/*",
+                  "https://chat.openai.com/*"
+                ],
+                "js": [
+                  "content.js"
+                ],
+                "run_at": "document_idle"
+              }
+            ]
+          }
+          EOF
+
+      - name: Write background router
         shell: bash
         run: |
           cat > background.js <<'EOF'
-          const CHATGPT_HOSTS = new Set(["chatgpt.com", "chat.openai.com"]);
+          const CHATGPT_HOSTS = new Set([
+            "chatgpt.com",
+            "chat.openai.com"
+          ]);
+
           const CHATGPT_URL = "https://chatgpt.com/";
 
           function isChatGPTUrl(url = "") {
@@ -32,144 +80,264 @@ jobs:
 
           async function findChatGPTTab() {
             const tabs = await chrome.tabs.query({});
-            const candidates = tabs.filter(t => isChatGPTUrl(t.url));
-            if (!candidates.length) return null;
 
-            const complete = candidates.filter(t => t.status === "complete");
+            const candidates = tabs
+              .filter(tab => isChatGPTUrl(tab.url))
+              .sort((a, b) => {
+                if (a.active !== b.active) return a.active ? -1 : 1;
+                return (b.id || 0) - (a.id || 0);
+              });
 
-            return (complete.length ? complete : candidates)
-              .sort((a, b) => (b.id ?? 0) - (a.id ?? 0))[0] || null;
+            return candidates[0] || null;
           }
 
           async function openOrReuseChatGPT() {
             const existing = await findChatGPTTab();
 
             if (existing?.id != null) {
-              await chrome.tabs.update(existing.id, { active: true });
+              await chrome.windows.update(existing.windowId, {
+                focused: true
+              });
 
-              if (existing.windowId != null) {
-                await chrome.windows.update(existing.windowId, { focused: true });
-              }
+              await chrome.tabs.update(existing.id, {
+                active: true
+              });
 
-              return existing;
+              return {
+                tab: existing,
+                reused: true
+              };
             }
 
-            return chrome.tabs.create({
+            const tab = await chrome.tabs.create({
               url: CHATGPT_URL,
               active: true
             });
+
+            return {
+              tab,
+              reused: false
+            };
+          }
+
+          async function ensureBridge(tabId) {
+            try {
+              await chrome.tabs.sendMessage(tabId, {
+                type: "PING_CHATGPT"
+              });
+
+              return true;
+            } catch {
+              await chrome.scripting.executeScript({
+                target: {
+                  tabId,
+                  allFrames: false
+                },
+                files: ["content.js"]
+              });
+
+              await new Promise(resolve => setTimeout(resolve, 150));
+
+              try {
+                await chrome.tabs.sendMessage(tabId, {
+                  type: "PING_CHATGPT"
+                });
+
+                return true;
+              } catch {
+                return false;
+              }
+            }
           }
 
           chrome.runtime.onInstalled.addListener(() => {
-            chrome.storage.local.get(["workflows"], r => {
-              if (!r.workflows) {
-                chrome.storage.local.set({ workflows: {} });
+            chrome.storage.local.get(["workflows"], result => {
+              if (!result.workflows) {
+                chrome.storage.local.set({
+                  workflows: {}
+                });
               }
             });
 
             chrome.sidePanel
-              .setPanelBehavior({ openPanelOnActionClick: true })
+              .setPanelBehavior({
+                openPanelOnActionClick: true
+              })
               .catch(console.error);
           });
 
           chrome.runtime.onStartup.addListener(() => {
             chrome.sidePanel
-              .setPanelBehavior({ openPanelOnActionClick: true })
+              .setPanelBehavior({
+                openPanelOnActionClick: true
+              })
               .catch(console.error);
           });
 
           chrome.action.onClicked.addListener(async tab => {
             try {
-              await chrome.sidePanel.open({ windowId: tab.windowId });
-            } catch (e) {
-              console.error("Could not open side panel:", e);
+              await chrome.sidePanel.open({
+                windowId: tab.windowId
+              });
+            } catch (error) {
+              console.error(
+                "Could not open side panel:",
+                error
+              );
             }
           });
 
-          chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-            if (msg?.type === "OPEN_CHATGPT") {
-              openOrReuseChatGPT()
-                .then(tab => reply({
-                  ok: true,
-                  tabId: tab?.id ?? null,
-                  reused: !!tab
-                }))
-                .catch(e => reply({
-                  ok: false,
-                  error: e.message
-                }));
+          chrome.runtime.onMessage.addListener(
+            (message, sender, reply) => {
 
-              return true;
+              if (message?.type === "OPEN_CHATGPT") {
+                openOrReuseChatGPT()
+                  .then(async result => {
+                    if (result.tab?.id != null) {
+                      await ensureBridge(result.tab.id);
+                    }
+
+                    reply({
+                      ok: true,
+                      tabId: result.tab?.id ?? null,
+                      reused: result.reused
+                    });
+                  })
+                  .catch(error => {
+                    reply({
+                      ok: false,
+                      error: error.message
+                    });
+                  });
+
+                return true;
+              }
+
+              if (message?.type === "FIND_CHATGPT") {
+                findChatGPTTab()
+                  .then(async tab => {
+                    let ready = false;
+
+                    if (tab?.id != null) {
+                      ready = await ensureBridge(tab.id);
+                    }
+
+                    reply({
+                      ok: true,
+                      tabId: tab?.id ?? null,
+                      windowId: tab?.windowId ?? null,
+                      url: tab?.url ?? null,
+                      ready
+                    });
+                  })
+                  .catch(error => {
+                    reply({
+                      ok: false,
+                      error: error.message
+                    });
+                  });
+
+                return true;
+              }
+
+              if (message?.type === "ENSURE_BRIDGE") {
+                ensureBridge(message.tabId)
+                  .then(ready => reply({
+                    ok: ready
+                  }))
+                  .catch(error => reply({
+                    ok: false,
+                    error: error.message
+                  }));
+
+                return true;
+              }
             }
-
-            if (msg?.type === "FIND_CHATGPT") {
-              findChatGPTTab()
-                .then(tab => reply({
-                  ok: true,
-                  tabId: tab?.id ?? null,
-                  windowId: tab?.windowId ?? null,
-                  url: tab?.url ?? null
-                }))
-                .catch(e => reply({
-                  ok: false,
-                  error: e.message
-                }));
-
-              return true;
-            }
-          });
+          );
           EOF
 
-      - name: Upgrade ChatGPT bridge
+      - name: Write ChatGPT bridge
         shell: bash
         run: |
           cat > content.js <<'EOF'
           (() => {
-            function visible(el) {
-              if (!el) return false;
+            if (window.__CHATGPT_LOCAL_ORCHESTRATOR__) {
+              return;
+            }
 
-              const r = el.getBoundingClientRect();
-              const s = getComputedStyle(el);
+            window.__CHATGPT_LOCAL_ORCHESTRATOR__ = true;
+
+            function visible(element) {
+              if (!element) return false;
+
+              const rect = element.getBoundingClientRect();
+              const style = getComputedStyle(element);
 
               return (
-                r.width > 100 &&
-                r.height > 20 &&
-                s.display !== "none" &&
-                s.visibility !== "hidden"
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== "none" &&
+                style.visibility !== "hidden"
               );
             }
 
             function findComposer() {
-              const candidates = [
-                ...document.querySelectorAll("textarea"),
-                ...document.querySelectorAll(
-                  'div[contenteditable="true"][role="textbox"]'
-                ),
-                ...document.querySelectorAll(
-                  'div[contenteditable="true"]'
-                )
+              const selectors = [
+                "textarea",
+                'div[contenteditable="true"][role="textbox"]',
+                'div[contenteditable="true"]'
               ];
 
-              return candidates.filter(visible).pop() || null;
+              const candidates = [];
+
+              for (const selector of selectors) {
+                candidates.push(
+                  ...document.querySelectorAll(selector)
+                );
+              }
+
+              return candidates
+                .filter(visible)
+                .filter(element => {
+                  const aria = (
+                    element.getAttribute("aria-label") || ""
+                  ).toLowerCase();
+
+                  const placeholder = (
+                    element.getAttribute("placeholder") || ""
+                  ).toLowerCase();
+
+                  return (
+                    aria.includes("message") ||
+                    aria.includes("prompt") ||
+                    placeholder.includes("message") ||
+                    placeholder.includes("prompt") ||
+                    element.tagName === "TEXTAREA"
+                  );
+                })
+                .pop() || candidates.filter(visible).pop() || null;
             }
 
-            function setText(el, text) {
-              el.focus();
+            function setComposerText(element, text) {
+              element.focus();
 
-              if (el.tagName === "TEXTAREA") {
+              if (element.tagName === "TEXTAREA") {
                 const setter =
                   Object.getOwnPropertyDescriptor(
                     HTMLTextAreaElement.prototype,
                     "value"
                   )?.set;
 
-                if (setter) setter.call(el, text);
-                else el.value = text;
+                if (setter) {
+                  setter.call(element, text);
+                } else {
+                  element.value = text;
+                }
               } else {
-                el.textContent = text;
+                element.textContent = text;
               }
 
-              el.dispatchEvent(
+              element.dispatchEvent(
                 new InputEvent("input", {
                   bubbles: true,
                   inputType: "insertText",
@@ -177,184 +345,555 @@ jobs:
                 })
               );
 
-              el.dispatchEvent(new Event("change", { bubbles: true }));
+              element.dispatchEvent(
+                new Event("change", {
+                  bubbles: true
+                })
+              );
             }
 
             function findSendButton() {
-              return [
-                ...document.querySelectorAll("button,[role='button']")
-              ].find(button => {
-                if (!visible(button)) return false;
-
-                const text = (
-                  (button.getAttribute("aria-label") || "") +
-                  " " +
-                  (button.innerText || "")
-                ).toLowerCase();
-
-                return /send|submit/.test(text) && !/stop/.test(text);
-              });
-            }
-
-            function clickSend() {
-              const button = findSendButton();
-
-              if (!button) return false;
-
-              button.click();
-              return true;
-            }
-
-            function captureResponse() {
-              const nodes = [
-                ...document.querySelectorAll(
-                  '[data-message-author-role="assistant"]'
-                ),
-                ...document.querySelectorAll(".markdown")
+              const direct = [
+                'button[data-testid="send-button"]',
+                'button[aria-label*="Send"]',
+                'button[aria-label*="send"]',
+                'button[data-testid*="send"]'
               ];
 
-              const texts = nodes
-                .filter(visible)
-                .map(e => (e.innerText || "").trim())
-                .filter(Boolean);
+              for (const selector of direct) {
+                const button = document.querySelector(selector);
 
-              return [...new Set(texts)].pop() || "";
+                if (visible(button) && !button.disabled) {
+                  return button;
+                }
+              }
+
+              const buttons = [
+                ...document.querySelectorAll(
+                  "button,[role='button']"
+                )
+              ];
+
+              return buttons
+                .filter(visible)
+                .filter(button => !button.disabled)
+                .find(button => {
+                  const label = (
+                    (button.getAttribute("aria-label") || "") +
+                    " " +
+                    (button.getAttribute("data-testid") || "") +
+                    " " +
+                    (button.innerText || "")
+                  ).toLowerCase();
+
+                  return (
+                    label.includes("send") &&
+                    !label.includes("stop") &&
+                    !label.includes("cancel")
+                  );
+                }) || null;
             }
 
-            async function waitForComposer(timeout = 10000) {
+            function sendWithKeyboard(element) {
+              element.focus();
+
+              element.dispatchEvent(
+                new KeyboardEvent("keydown", {
+                  key: "Enter",
+                  code: "Enter",
+                  keyCode: 13,
+                  which: 13,
+                  bubbles: true
+                })
+              );
+            }
+
+            async function waitForComposer(
+              timeout = 15000
+            ) {
               const start = Date.now();
 
               while (Date.now() - start < timeout) {
                 const composer = findComposer();
 
-                if (composer) return composer;
+                if (composer) {
+                  return composer;
+                }
 
-                await new Promise(resolve => setTimeout(resolve, 250));
+                await new Promise(resolve =>
+                  setTimeout(resolve, 250)
+                );
               }
 
               return null;
             }
 
-            chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-              if (msg?.type === "PING_CHATGPT") {
-                reply({
-                  ok: true,
-                  ready: !!findComposer()
-                });
-                return;
+            async function waitForSendButton(
+              timeout = 5000
+            ) {
+              const start = Date.now();
+
+              while (Date.now() - start < timeout) {
+                const button = findSendButton();
+
+                if (button) {
+                  return button;
+                }
+
+                await new Promise(resolve =>
+                  setTimeout(resolve, 200)
+                );
               }
 
-              if (msg?.type === "SEND_PROMPT") {
-                (async () => {
-                  const composer = await waitForComposer();
+              return null;
+            }
 
-                  if (!composer) {
-                    reply({
-                      ok: false,
-                      error: "ChatGPT composer did not become ready."
-                    });
-                    return;
+            function captureResponse() {
+              const selectors = [
+                '[data-message-author-role="assistant"]',
+                '[data-message-author-role="assistant"] .markdown',
+                ".markdown"
+              ];
+
+              const texts = [];
+
+              for (const selector of selectors) {
+                for (
+                  const element of
+                  document.querySelectorAll(selector)
+                ) {
+                  if (!visible(element)) continue;
+
+                  const text = (
+                    element.innerText || ""
+                  ).trim();
+
+                  if (text) {
+                    texts.push(text);
                   }
+                }
+              }
 
-                  setText(composer, msg.text);
+              return [...new Set(texts)].pop() || "";
+            }
 
-                  await new Promise(resolve => setTimeout(resolve, 300));
+            chrome.runtime.onMessage.addListener(
+              (message, sender, reply) => {
 
-                  if (!clickSend()) {
-                    reply({
-                      ok: false,
-                      error: "ChatGPT send button was not available."
-                    });
-                    return;
-                  }
-
+                if (message?.type === "PING_CHATGPT") {
                   reply({
-                    ok: true
+                    ok: true,
+                    ready: !!findComposer()
                   });
-                })();
 
-                return true;
-              }
+                  return;
+                }
 
-              if (msg?.type === "CAPTURE_RESPONSE") {
-                reply({
-                  ok: true,
-                  text: captureResponse()
-                });
+                if (message?.type === "SEND_PROMPT") {
+                  (async () => {
+                    const composer =
+                      await waitForComposer();
+
+                    if (!composer) {
+                      reply({
+                        ok: false,
+                        error:
+                          "ChatGPT composer was not found."
+                      });
+
+                      return;
+                    }
+
+                    setComposerText(
+                      composer,
+                      message.text
+                    );
+
+                    await new Promise(resolve =>
+                      setTimeout(resolve, 500)
+                    );
+
+                    const sendButton =
+                      await waitForSendButton();
+
+                    if (sendButton) {
+                      sendButton.click();
+
+                      reply({
+                        ok: true,
+                        method: "button"
+                      });
+
+                      return;
+                    }
+
+                    sendWithKeyboard(composer);
+
+                    await new Promise(resolve =>
+                      setTimeout(resolve, 300)
+                    );
+
+                    reply({
+                      ok: true,
+                      method: "keyboard"
+                    });
+                  })();
+
+                  return true;
+                }
+
+                if (message?.type === "CAPTURE_RESPONSE") {
+                  reply({
+                    ok: true,
+                    text: captureResponse()
+                  });
+
+                  return;
+                }
               }
-            });
+            );
           })();
           EOF
 
-      - name: Upgrade side panel
+      - name: Write side panel
+        shell: bash
+        run: |
+          cat > sidepanel.js <<'EOF'
+          const $ = id => document.getElementById(id);
+
+          const trace = [];
+
+          let recognition = null;
+
+          function log(type, message) {
+            trace.push(
+              `[${new Date().toLocaleTimeString()}] ${type}: ${message}`
+            );
+
+            $("trace").textContent =
+              trace.slice(-40).join("\n");
+          }
+
+          async function locateChatGPT() {
+            const result =
+              await chrome.runtime.sendMessage({
+                type: "FIND_CHATGPT"
+              });
+
+            if (
+              result?.ok &&
+              result.tabId != null
+            ) {
+              return await chrome.tabs.get(
+                result.tabId
+              );
+            }
+
+            const opened =
+              await chrome.runtime.sendMessage({
+                type: "OPEN_CHATGPT"
+              });
+
+            if (
+              !opened?.ok ||
+              opened.tabId == null
+            ) {
+              throw new Error(
+                opened?.error ||
+                "Could not locate ChatGPT."
+              );
+            }
+
+            return await chrome.tabs.get(
+              opened.tabId
+            );
+          }
+
+          async function ensureChatGPTReady(tab) {
+            let ready = false;
+
+            try {
+              const ping =
+                await chrome.tabs.sendMessage(
+                  tab.id,
+                  {
+                    type: "PING_CHATGPT"
+                  }
+                );
+
+              ready = !!ping?.ok;
+            } catch {
+              const result =
+                await chrome.runtime.sendMessage({
+                  type: "ENSURE_BRIDGE",
+                  tabId: tab.id
+                });
+
+              ready = !!result?.ok;
+            }
+
+            if (!ready) {
+              throw new Error(
+                "Could not establish the ChatGPT bridge."
+              );
+            }
+          }
+
+          async function sendText(text) {
+            const tab =
+              await locateChatGPT();
+
+            await ensureChatGPTReady(tab);
+
+            let result;
+
+            try {
+              result =
+                await chrome.tabs.sendMessage(
+                  tab.id,
+                  {
+                    type: "SEND_PROMPT",
+                    text
+                  }
+                );
+            } catch {
+              await ensureChatGPTReady(tab);
+
+              result =
+                await chrome.tabs.sendMessage(
+                  tab.id,
+                  {
+                    type: "SEND_PROMPT",
+                    text
+                  }
+                );
+            }
+
+            if (!result?.ok) {
+              throw new Error(
+                result?.error ||
+                "Could not send prompt."
+              );
+            }
+
+            log(
+              "EXECUTE",
+              `Prompt submitted via ${result.method || "bridge"}.`
+            );
+          }
+
+          $("send").onclick = async () => {
+            const text =
+              $("prompt").value.trim();
+
+            if (!text) return;
+
+            try {
+              await sendText(text);
+
+              $("prompt").value = "";
+
+              $("response").textContent =
+                "Waiting for visible response…";
+            } catch (error) {
+              log(
+                "ERROR",
+                error.message
+              );
+            }
+          };
+
+          $("continue").onclick = async () => {
+            try {
+              const tab =
+                await locateChatGPT();
+
+              await ensureChatGPTReady(tab);
+
+              const result =
+                await chrome.tabs.sendMessage(
+                  tab.id,
+                  {
+                    type: "CAPTURE_RESPONSE"
+                  }
+                );
+
+              if (result?.text) {
+                $("response").textContent =
+                  result.text;
+
+                log(
+                  "OBSERVE",
+                  "Captured current visible response."
+                );
+              } else {
+                log(
+                  "OBSERVE",
+                  "No visible response found."
+                );
+              }
+            } catch (error) {
+              log(
+                "ROUTE",
+                error.message
+              );
+            }
+          };
+
+          $("newchat").onclick = async () => {
+            try {
+              const result =
+                await chrome.runtime.sendMessage({
+                  type: "OPEN_CHATGPT"
+                });
+
+              if (!result?.ok) {
+                throw new Error(
+                  result?.error ||
+                  "Could not open ChatGPT."
+                );
+              }
+
+              log(
+                "ROUTE",
+                result.reused
+                  ? "Reused existing ChatGPT target."
+                  : "Opened a new ChatGPT target."
+              );
+            } catch (error) {
+              log(
+                "ERROR",
+                error.message
+              );
+            }
+          };
+
+          $("mic").onclick = () => {
+            const SpeechRecognition =
+              window.SpeechRecognition ||
+              window.webkitSpeechRecognition;
+
+            if (!SpeechRecognition) {
+              log(
+                "VOICE",
+                "Speech recognition is unavailable in this browser context."
+              );
+
+              return;
+            }
+
+            try {
+              recognition =
+                new SpeechRecognition();
+
+              recognition.continuous = true;
+              recognition.interimResults = true;
+              recognition.lang =
+                navigator.language || "en-US";
+
+              recognition.onstart = () => {
+                $("mic").disabled = true;
+                $("stop").disabled = false;
+
+                log(
+                  "VOICE",
+                  "Listening."
+                );
+              };
+
+              recognition.onresult = event => {
+                let text = "";
+
+                for (
+                  let i = event.resultIndex;
+                  i < event.results.length;
+                  i++
+                ) {
+                  text +=
+                    event.results[i][0].transcript;
+                }
+
+                $("prompt").value = text;
+              };
+
+              recognition.onerror = event => {
+                log(
+                  "VOICE",
+                  `Error: ${event.error}`
+                );
+              };
+
+              recognition.onend = () => {
+                $("mic").disabled = false;
+                $("stop").disabled = true;
+              };
+
+              recognition.start();
+            } catch (error) {
+              log(
+                "VOICE",
+                `Could not start recognition: ${error.message}`
+              );
+            }
+          };
+
+          $("stop").onclick = () => {
+            recognition?.stop();
+          };
+          EOF
+
+      - name: Update version
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path("sidepanel.js")
-          s = p.read_text()
+          p = Path("README.txt")
 
-          s = s.replace(
-              '''async function activeChat(){const tabs=await chrome.tabs.query({active:true,lastFocusedWindow:true});const tab=tabs[0];if(!tab||!/^https:\\/\\/(chatgpt\\\\.com|chat\\\\.openai\\\\.com)\\\\//.test(tab.url||""))throw new Error("Active tab is not ChatGPT. Use Open ChatGPT or switch to a ChatGPT tab.");return tab;}''',
-              '''async function activeChat(){
-                const result=await chrome.runtime.sendMessage({type:"FIND_CHATGPT"});
-                if(result?.ok&&result.tabId!=null){
-                  return await chrome.tabs.get(result.tabId);
-                }
-                const opened=await chrome.runtime.sendMessage({type:"OPEN_CHATGPT"});
-                if(!opened?.ok||opened.tabId==null)throw new Error(opened?.error||"Could not locate ChatGPT.");
-                return await chrome.tabs.get(opened.tabId);
-              }'''
-          )
-
-          s = s.replace(
-              '''async function sendText(text){const tab=await activeChat();const r=await chrome.tabs.sendMessage(tab.id,{type:"SEND_PROMPT",text});if(!r?.ok)throw new Error(r?.error||"Could not send.");log("EXECUTE","Submitted prompt through the visible ChatGPT UI.");}''',
-              '''async function sendText(text){
-                const tab=await activeChat();
-                let r;
-                try{
-                  r=await chrome.tabs.sendMessage(tab.id,{type:"SEND_PROMPT",text});
-                }catch(e){
-                  throw new Error("ChatGPT bridge is not ready. Reload the ChatGPT tab and try again.");
-                }
-                if(!r?.ok)throw new Error(r?.error||"Could not send.");
-                log("EXECUTE","Submitted prompt through the visible ChatGPT UI.");
-              }'''
-          )
-
-          s = s.replace(
-              '''$(\"newchat\").onclick=()=>chrome.runtime.sendMessage({type:"OPEN_CHATGPT"},r=>r?.ok?log("ROUTE","Opened a ChatGPT tab."):log("ERROR",r?.error||"Could not open ChatGPT."));''',
-              '''$(\"newchat\").onclick=async()=>{
-                try{
-                  const r=await chrome.runtime.sendMessage({type:"OPEN_CHATGPT"});
-                  if(!r?.ok)throw new Error(r?.error||"Could not open ChatGPT.");
-                  log("ROUTE","Located or opened the ChatGPT target.");
-                }catch(e){
-                  log("ERROR",e.message);
-                }
-              };'''
-          )
-
-          p.write_text(s)
+          if p.exists():
+              text = p.read_text()
+              text = text.replace(
+                  "CHATGPT LOCAL ORCHESTRATOR v3.2",
+                  "CHATGPT LOCAL ORCHESTRATOR v3.3"
+              )
+              p.write_text(text)
           PY
 
       - name: Validate manifest
         run: |
-          node -e "const m=require('./manifest.json'); if(m.manifest_version !== 3) process.exit(1); console.log('Manifest OK:', m.name, m.version)"
+          node - <<'NODE'
+          const fs = require("fs");
+          const manifest = JSON.parse(
+            fs.readFileSync("manifest.json", "utf8")
+          );
 
-      - name: Validate source files
+          if (manifest.manifest_version !== 3) {
+            throw new Error("Manifest must be version 3.");
+          }
+
+          if (!manifest.permissions.includes("scripting")) {
+            throw new Error(
+              "Manifest must include scripting permission."
+            );
+          }
+
+          console.log(
+            `Manifest OK: ${manifest.name} ${manifest.version}`
+          );
+          NODE
+
+      - name: Validate JavaScript
         run: |
-          test -s background.js
-          test -s content.js
-          test -s sidepanel.js
-          test -s sidepanel.html
-          echo "Extension source validation passed."
+          node --check background.js
+          node --check content.js
+          node --check sidepanel.js
 
-      - name: Package extension
+      - name: Package production extension
         run: |
           rm -f chatgpt-local-orchestrator-production.zip
-          zip -r chatgpt-local-orchestrator-production.zip \
+
+          zip -r \
+            chatgpt-local-orchestrator-production.zip \
             manifest.json \
             background.js \
             content.js \
@@ -365,19 +904,21 @@ jobs:
             -x "*.DS_Store"
 
       - name: Commit production build
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add \
+            manifest.json \
             background.js \
             content.js \
             sidepanel.js \
+            README.txt \
             chatgpt-local-orchestrator-production.zip
 
-          if git diff --cached --quiet; then
-            echo "No production changes to commit."
-          else
-            git commit -m "Build resilient ChatGPT orchestrator"
-            git push
-          fi
+          git commit \
+            -m "Release resilient orchestrator 3.3.0"
+
+          git push
